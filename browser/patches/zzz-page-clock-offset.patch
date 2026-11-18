@@ -1,0 +1,515 @@
+diff --git a/dom/base/nsDOMNavigationTiming.cpp b/dom/base/nsDOMNavigationTiming.cpp
+index ceb698a..eb4d109 100644
+--- a/dom/base/nsDOMNavigationTiming.cpp
++++ b/dom/base/nsDOMNavigationTiming.cpp
+@@ -4,9 +4,13 @@
+ 
+ #include "nsDOMNavigationTiming.h"
+ 
++#include <algorithm>
++
+ #include "GeckoProfiler.h"
+ #include "SharedLcpMarkerState.h"
++#include "mozilla/Atomics.h"
+ #include "mozilla/ProfilerMarkers.h"
++#include "mozilla/StaticMutex.h"
+ #include "mozilla/TimeStamp.h"
+ #include "mozilla/dom/Document.h"
+ #include "mozilla/glean/DomMetrics.h"
+@@ -18,6 +22,8 @@
+ #include "nsIScriptSecurityManager.h"
+ #include "nsIURI.h"
+ #include "nsPrintfCString.h"
++#include "nsTArray.h"
++#include "nsTHashMap.h"
+ #include "prtime.h"
+ 
+ using namespace mozilla;
+@@ -88,10 +94,124 @@ DOMTimeMilliSec nsDOMNavigationTiming::TimeStampToDOM(TimeStamp aStamp) const {
+     return 0;
+   }
+ 
+-  TimeDuration duration = aStamp - mNavigationStart;
++  TimeDuration duration = PageClockStamp(aStamp) - mNavigationStart;
+   return GetNavigationStart() + static_cast<int64_t>(duration.ToMilliseconds());
+ }
+ 
++namespace {
++
++// CamoufoxPageClockSegment is the page clock offset in milliseconds in effect
++// from a real time stamp on
++struct CamoufoxPageClockSegment {
++  TimeStamp mSince;
++  double mOffset;
++};
++
++// CamoufoxPageClock is the clock of one page: its offset segments in time
++// order and the latest time stamp the page has seen
++struct CamoufoxPageClock {
++  nsTArray<CamoufoxPageClockSegment> mSegments;
++  TimeStamp mObserved;
++};
++
++static StaticMutex sCamoufoxPageClockMutex MOZ_UNANNOTATED;
++static Atomic<bool, Relaxed> sCamoufoxPageClocksActive(false);
++static nsTHashMap<nsUint64HashKey, CamoufoxPageClock>* sCamoufoxPageClocks;
++
++// CamoufoxMapPageClock maps a real time stamp to the page time stamp: the
++// offset of the segment in effect at aStamp, capped by where the next segment
++// starts so that page time never decreases, and records it as seen
++TimeStamp CamoufoxMapPageClock(CamoufoxPageClock& aClock, TimeStamp aStamp) {
++  const nsTArray<CamoufoxPageClockSegment>& segments = aClock.mSegments;
++  size_t low = 0;
++  size_t high = segments.Length();
++  while (low < high) {
++    size_t middle = (low + high) / 2;
++    if (segments[middle].mSince <= aStamp) {
++      low = middle + 1;
++    } else {
++      high = middle;
++    }
++  }
++  double offset = low ? segments[low - 1].mOffset : 0;
++  TimeStamp result = aStamp + TimeDuration::FromMilliseconds(offset);
++  if (low < segments.Length()) {
++    TimeStamp limit = segments[low].mSince +
++                      TimeDuration::FromMilliseconds(segments[low].mOffset);
++    if (limit < result) {
++      result = limit;
++    }
++  }
++  if (aClock.mObserved.IsNull() || aClock.mObserved < result) {
++    aClock.mObserved = result;
++  }
++  return result;
++}
++
++}  // namespace
++
++TimeStamp nsDOMNavigationTiming::PageClockStamp(TimeStamp aStamp) const {
++  if (!sCamoufoxPageClocksActive) {
++    return aStamp;
++  }
++  if (!mPageClockTop && mDocShell) {
++    if (mozilla::dom::BrowsingContext* context =
++            mDocShell->GetBrowsingContext()) {
++      mPageClockTop = context->Top()->Id();
++    }
++  }
++  return PageClockStampFor(mPageClockTop, aStamp);
++}
++
++/* static */
++bool nsDOMNavigationTiming::PageClocksActive() {
++  return sCamoufoxPageClocksActive;
++}
++
++/* static */
++TimeStamp nsDOMNavigationTiming::PageClockStampFor(uint64_t aTop,
++                                                   TimeStamp aStamp) {
++  if (!sCamoufoxPageClocksActive || !aTop || aStamp.IsNull()) {
++    return aStamp;
++  }
++  StaticMutexAutoLock lock(sCamoufoxPageClockMutex);
++  CamoufoxPageClock* clock = sCamoufoxPageClocks->Lookup(aTop).DataPtrOrNull();
++  if (!clock) {
++    return aStamp;
++  }
++  return CamoufoxMapPageClock(*clock, aStamp);
++}
++
++/* static */
++double nsDOMNavigationTiming::GetPageClockOffset(uint64_t aTop) {
++  if (!sCamoufoxPageClocksActive) {
++    return 0;
++  }
++  StaticMutexAutoLock lock(sCamoufoxPageClockMutex);
++  CamoufoxPageClock* clock = sCamoufoxPageClocks->Lookup(aTop).DataPtrOrNull();
++  if (!clock || clock->mSegments.IsEmpty()) {
++    return 0;
++  }
++  return clock->mSegments.LastElement().mOffset;
++}
++
++/* static */
++void nsDOMNavigationTiming::SetPageClockOffset(uint64_t aTop,
++                                               double aMilliseconds) {
++  StaticMutexAutoLock lock(sCamoufoxPageClockMutex);
++  if (!sCamoufoxPageClocks) {
++    sCamoufoxPageClocks = new nsTHashMap<nsUint64HashKey, CamoufoxPageClock>();
++  }
++  CamoufoxPageClock& clock = sCamoufoxPageClocks->LookupOrInsert(aTop);
++  TimeStamp now = TimeStamp::Now();
++  double offset = aMilliseconds;
++  if (!clock.mObserved.IsNull()) {
++    offset = std::max(offset, (clock.mObserved - now).ToMilliseconds());
++  }
++  clock.mSegments.AppendElement(CamoufoxPageClockSegment{now, offset});
++  sCamoufoxPageClocksActive = true;
++}
++
+ void nsDOMNavigationTiming::NotifyNavigationStart(
+     DocShellState aDocShellState) {
+   mNavigationStartHighRes = (double)PR_Now() / PR_USEC_PER_MSEC;
+diff --git a/dom/base/nsDOMNavigationTiming.h b/dom/base/nsDOMNavigationTiming.h
+index c6c43b9..03844a0 100644
+--- a/dom/base/nsDOMNavigationTiming.h
++++ b/dom/base/nsDOMNavigationTiming.h
+@@ -188,10 +188,30 @@ class nsDOMNavigationTiming final : public mozilla::RelativeTimeline {
+     if (aStamp.IsNull()) {
+       return 0;
+     }
+-    mozilla::TimeDuration duration = aStamp - mNavigationStart;
++    mozilla::TimeDuration duration = PageClockStamp(aStamp) - mNavigationStart;
+     return duration.ToMilliseconds();
+   }
+ 
++  // Camoufox: the time stamp the page of this document sees for aStamp
++  mozilla::TimeStamp PageClockStamp(mozilla::TimeStamp aStamp) const;
++
++  // Camoufox: whether any page clock offset has been set in this process
++  static bool PageClocksActive();
++
++  // Camoufox: the time stamp the page of the top-level browsing context aTop
++  // sees for aStamp
++  static mozilla::TimeStamp PageClockStampFor(uint64_t aTop,
++                                              mozilla::TimeStamp aStamp);
++
++  // Camoufox: the current clock offset in milliseconds of the page of the
++  // top-level browsing context aTop
++  static double GetPageClockOffset(uint64_t aTop);
++
++  // Camoufox: sets the clock offset of the page of the top-level browsing
++  // context aTop from now on; the page time never goes below the latest time
++  // the page has seen
++  static void SetPageClockOffset(uint64_t aTop, double aMilliseconds);
++
+   // Called by the DocumentLoadListener before sending the timing information
+   // to the new content process.
+   void Anonymize(nsIURI* aFinalURI);
+@@ -261,6 +281,8 @@ class nsDOMNavigationTiming final : public mozilla::RelativeTimeline {
+ 
+   bool mDocShellHasBeenActiveSinceNavigationStart;
+   bool mWasActivatedFromNavigationalPrefetch = false;
++  // Camoufox: id of the top-level browsing context, 0 until known
++  mutable uint64_t mPageClockTop = 0;
+ 
+   friend struct IPC::ParamTraits<nsDOMNavigationTiming*>;
+ };
+diff --git a/dom/base/nsDOMWindowUtils.cpp b/dom/base/nsDOMWindowUtils.cpp
+index 6de9b68..b88a49a 100644
+--- a/dom/base/nsDOMWindowUtils.cpp
++++ b/dom/base/nsDOMWindowUtils.cpp
+@@ -4,6 +4,7 @@
+ 
+ #include "nsDOMWindowUtils.h"
+ 
++#include "nsDOMNavigationTiming.h"
+ #include <algorithm>
+ 
+ #include "CubebDeviceEnumerator.h"
+@@ -2830,6 +2831,26 @@ nsDOMWindowUtils::RestoreNormalRefresh() {
+   return NS_OK;
+ }
+ 
++NS_IMETHODIMP
++nsDOMWindowUtils::GetPageClockOffset(double* aOffset) {
++  nsCOMPtr<nsPIDOMWindowOuter> window = do_QueryReferent(mWindow);
++  NS_ENSURE_STATE(window);
++  BrowsingContext* context = window->GetBrowsingContext();
++  NS_ENSURE_STATE(context);
++  *aOffset = nsDOMNavigationTiming::GetPageClockOffset(context->Top()->Id());
++  return NS_OK;
++}
++
++NS_IMETHODIMP
++nsDOMWindowUtils::SetPageClockOffset(double aOffset) {
++  nsCOMPtr<nsPIDOMWindowOuter> window = do_QueryReferent(mWindow);
++  NS_ENSURE_STATE(window);
++  BrowsingContext* context = window->GetBrowsingContext();
++  NS_ENSURE_STATE(context);
++  nsDOMNavigationTiming::SetPageClockOffset(context->Top()->Id(), aOffset);
++  return NS_OK;
++}
++
+ NS_IMETHODIMP
+ nsDOMWindowUtils::GetIsTestControllingRefreshes(bool* aResult) {
+   nsPresContext* pc = GetPresContext();
+diff --git a/dom/interfaces/base/nsIDOMWindowUtils.idl b/dom/interfaces/base/nsIDOMWindowUtils.idl
+index e350233..e774d92 100644
+--- a/dom/interfaces/base/nsIDOMWindowUtils.idl
++++ b/dom/interfaces/base/nsIDOMWindowUtils.idl
+@@ -1520,6 +1520,14 @@ interface nsIDOMWindowUtils : nsISupports {
+    */
+   void restoreNormalRefresh();
+ 
++  /**
++   * Camoufox: offset in milliseconds of the clock the page of this window
++   * sees (performance.now, event.timeStamp, animation frame times, resource
++   * timing and Date) from real time. Setting it takes effect from now on and
++   * never moves the page time below the latest time the page has seen.
++   */
++  attribute double pageClockOffset;
++
+   /**
+    * Reports whether the current state is test-controlled refreshes
+    * (see advanceTimeAndRefresh and restoreNormalRefresh above).
+diff --git a/dom/performance/Performance.cpp b/dom/performance/Performance.cpp
+index 1a01ab1..79e5ce3 100644
+--- a/dom/performance/Performance.cpp
++++ b/dom/performance/Performance.cpp
+@@ -159,7 +159,14 @@ DOMHighResTimeStamp Performance::Now() {
+ }
+ 
+ DOMHighResTimeStamp Performance::NowUnclamped() const {
+-  TimeDuration duration = TimeStamp::Now() - CreationTimeStamp();
++  TimeStamp now = TimeStamp::Now();
++  // Camoufox: windows see the clock of their page
++  if (NS_IsMainThread()) {
++    if (nsDOMNavigationTiming* timing = GetDOMTiming()) {
++      now = timing->PageClockStamp(now);
++    }
++  }
++  TimeDuration duration = now - CreationTimeStamp();
+   return duration.ToMilliseconds();
+ }
+ 
+diff --git a/remote/shared/webdriver/Actions.sys.mjs b/remote/shared/webdriver/Actions.sys.mjs
+index 146c344..2f9ed93 100644
+--- a/remote/shared/webdriver/Actions.sys.mjs
++++ b/remote/shared/webdriver/Actions.sys.mjs
+@@ -62,6 +62,15 @@ XPCOMUtils.defineLazyPreferenceGetter(
+   false
+ );
+ 
++// Camoufox: flag, that indicates if pauses and pointer moves pass page time
++// through the page clock of the target context instead of waiting.
++XPCOMUtils.defineLazyPreferenceGetter(
++  actions,
++  "virtualInputTime",
++  "camoufox.virtual_input_time",
++  false
++);
++
+ // Flag, that indicates if an async widget event should be used when dispatching a touch event.
+ XPCOMUtils.defineLazyPreferenceGetter(
+   actions,
+@@ -978,13 +987,16 @@ class PauseAction extends NullAction {
+    * @returns {Promise}
+    *     Promise that is resolved once the action is complete.
+    */
+-  dispatch(state, inputSource, tickDuration) {
++  dispatch(state, inputSource, tickDuration, options) {
+     const ms = this.duration ?? tickDuration;
+ 
+     lazy.logger.trace(
+       ` Dispatch ${this.constructor.name} with ${this.id} ${ms}`
+     );
+ 
++    if (actions.virtualInputTime && options?.passPageTime) {
++      return options.passPageTime(ms, options.context);
++    }
+     return lazy.Sleep(ms);
+   }
+ 
+@@ -1670,7 +1682,8 @@ class PointerMoveAction extends PointerAction {
+       this.duration ?? tickDuration,
+       context,
+       async _target =>
+-        await this.performPointerMoveStep(state, inputSource, _target, options)
++        await this.performPointerMoveStep(state, inputSource, _target, options),
++      actions.virtualInputTime ? options.passPageTime : undefined
+     );
+   }
+ 
+@@ -2440,7 +2453,8 @@ async function moveOverTime(
+   targetCoords,
+   duration,
+   context,
+-  callback
++  callback,
++  passPageTime
+ ) {
+   if (startCoords.length !== targetCoords.length) {
+     throw new Error(
+@@ -2480,6 +2494,23 @@ async function moveOverTime(
+   // dispatching, keeping event timing consistent while honoring |duration|.
+   const steps = Math.max(1, Math.round(duration / FP60_INTERVAL));
+ 
++  // Camoufox: pass each step of page time through the page clock and dispatch
++  // the steps without waiting for animation frames.
++  if (passPageTime) {
++    for (let step = 1; step < steps; step++) {
++      await passPageTime(duration / steps, context);
++      await callback(
++        startCoords.map((startCoord, i) => [
++          Math.floor((step / steps) * distances[i][0] + startCoord[0]),
++          Math.floor((step / steps) * distances[i][1] + startCoord[1]),
++        ])
++      );
++    }
++    await passPageTime(duration / steps, context);
++    await callback(targetCoords);
++    return;
++  }
++
+   const startTime = Date.now();
+   let dispatched = 0;
+ 
+diff --git a/remote/webdriver-bidi/modules/root/input.sys.mjs b/remote/webdriver-bidi/modules/root/input.sys.mjs
+index d617b45..88d1473 100644
+--- a/remote/webdriver-bidi/modules/root/input.sys.mjs
++++ b/remote/webdriver-bidi/modules/root/input.sys.mjs
+@@ -13,6 +13,7 @@ ChromeUtils.defineESModuleGetters(lazy, {
+   event: "chrome://remote/content/shared/webdriver/Event.sys.mjs",
+   NavigableManager: "chrome://remote/content/shared/NavigableManager.sys.mjs",
+   pprint: "chrome://remote/content/shared/Format.sys.mjs",
++  Sleep: "chrome://remote/content/shared/Sync.sys.mjs",
+ });
+ 
+ class InputModule extends RootBiDiModule {
+@@ -37,6 +38,7 @@ class InputModule extends RootBiDiModule {
+       dispatchEvent: this.#dispatchEvent.bind(this),
+       getClientRects: this.#getClientRects.bind(this),
+       getInViewCentrePoint: this.#getInViewCentrePoint.bind(this),
++      passPageTime: this.#passPageTime.bind(this),
+       toBrowserWindowCoordinates: this.#toBrowserWindowCoordinates.bind(this),
+     };
+   }
+@@ -237,6 +239,26 @@ class InputModule extends RootBiDiModule {
+     );
+   }
+ 
++  /**
++   * Camoufox: pass page time in the browsing context, taking it from the
++   * time the page clock lags behind real time and waiting for the rest.
++   *
++   * @param {number} ms
++   *     Page time to pass, in ms.
++   * @param {BrowsingContext} context
++   *     The browsing context whose page clock passes the time.
++   */
++  async #passPageTime(ms, context) {
++    const rest = await this._forwardToWindowGlobal(
++      "_passPageTime",
++      context.id,
++      { ms }
++    );
++    if (rest >= 0.5) {
++      await lazy.Sleep(Math.round(rest));
++    }
++  }
++
+   /**
+    * Resets the action's input state.
+    *
+@@ -321,6 +343,41 @@ class InputModule extends RootBiDiModule {
+     await this.#finalizeAction(context);
+   }
+ 
++  /**
++   * Camoufox: let the page clock of the browsing context lag behind real time
++   * by up to the given duration, as far as the page has not seen the time
++   * since; later pauses and pointer moves pass this lag before waiting.
++   *
++   * @param {object} options
++   * @param {string} options.context
++   *     Id of the browsing context.
++   * @param {number} options.duration
++   *     Longest lag, in ms.
++   *
++   * @returns {object}
++   *     The lag the page clock has, in ms.
++   */
++  async rewindPageClock(options = {}) {
++    const { context: contextId, duration } = options;
++
++    lazy.assert.string(
++      contextId,
++      lazy.pprint`Expected "context" to be a string, got ${contextId}`
++    );
++    lazy.assert.number(
++      duration,
++      lazy.pprint`Expected "duration" to be a number, got ${duration}`
++    );
++
++    const context = this._getNavigable(contextId);
++    const lag = await this._forwardToWindowGlobal(
++      "_rewindPageClock",
++      context.id,
++      { duration }
++    );
++    return { lag };
++  }
++
+   /**
+    * Reset the input state in the provided browsing context.
+    *
+diff --git a/remote/webdriver-bidi/modules/windowglobal/input.sys.mjs b/remote/webdriver-bidi/modules/windowglobal/input.sys.mjs
+index 060ec50..c9d81e0 100644
+--- a/remote/webdriver-bidi/modules/windowglobal/input.sys.mjs
++++ b/remote/webdriver-bidi/modules/windowglobal/input.sys.mjs
+@@ -284,6 +284,24 @@ class InputModule extends WindowGlobalBiDiModule {
+     await new Promise(resolve => Services.tm.dispatchToMainThread(resolve));
+   }
+ 
++  _passPageTime(options) {
++    const { ms } = options;
++    const windowUtils = this.messageHandler.window.windowUtils;
++    const offset = windowUtils.pageClockOffset;
++    const step = Math.min(ms, Math.max(-offset, 0));
++    if (step > 0) {
++      windowUtils.pageClockOffset = offset + step;
++    }
++    return ms - step;
++  }
++
++  _rewindPageClock(options) {
++    const { duration } = options;
++    const windowUtils = this.messageHandler.window.windowUtils;
++    windowUtils.pageClockOffset = -duration;
++    return -windowUtils.pageClockOffset;
++  }
++
+   async _getClientRects(options) {
+     const { element: reference } = options;
+ 
+diff --git a/toolkit/components/resistfingerprinting/nsRFPService.cpp b/toolkit/components/resistfingerprinting/nsRFPService.cpp
+index 93c024b..1960e72 100644
+--- a/toolkit/components/resistfingerprinting/nsRFPService.cpp
++++ b/toolkit/components/resistfingerprinting/nsRFPService.cpp
+@@ -64,11 +64,14 @@
+ #include "nsCOMPtr.h"
+ #include "nsContentUtils.h"
+ #include "nsCoord.h"
++#include "nsDOMNavigationTiming.h"
+ #include "nsTHashMap.h"
+ #include "nsDebug.h"
+ #include "nsError.h"
+ #include "nsHashKeys.h"
+ #include "nsJSUtils.h"
++#include "nsPIDOMWindow.h"
++#include "nsPIDOMWindowInlines.h"
+ #include "nsLiteralString.h"
+ #include "nsPrintfCString.h"
+ #include "nsServiceManagerUtils.h"
+@@ -874,6 +877,19 @@ double nsRFPService::ReduceTimePrecisionAsUSecsWrapper(
+ #endif
+ 
+   RTPCallerType callerType = RTPCallerTypeFromToken(aCallerType);
++  // Camoufox: Date in a window sees the clock of its page
++  if (nsDOMNavigationTiming::PageClocksActive() && NS_IsMainThread()) {
++    nsCOMPtr<nsIGlobalObject> current = xpc::CurrentNativeGlobal(aCx);
++    nsPIDOMWindowInner* window = current ? current->GetAsInnerWindow() : nullptr;
++    if (dom::BrowsingContext* context =
++            window ? window->GetBrowsingContext() : nullptr) {
++      TimeStamp now = TimeStamp::Now();
++      aTime += (nsDOMNavigationTiming::PageClockStampFor(context->Top()->Id(),
++                                                         now) -
++                now)
++                   .ToMicroseconds();
++    }
++  }
+   return nsRFPService::ReduceTimePrecisionImpl(
+       aTime, MicroSeconds, TimerResolution(callerType),
+       0, /* For absolute timestamps (all the JS engine does), supply zero

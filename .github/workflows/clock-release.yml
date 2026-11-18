@@ -1,0 +1,21 @@
+name: clock-release
+
+on:
+  workflow_dispatch:
+    inputs:
+      stage:
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: 转存安装包
+        run: |
+          gh release download "${{ inputs.stage }}" -R Mag1cFall/ProtocolLab-public -p "camoufox-158.0.1-clock.1-*.zip" -D assets
+          gh release create v158.0.1-clock.1 -R "${{ github.repository }}" --verify-tag --title v158.0.1-clock.1 --notes "以 Camoufox v158.0.1-beta.41 加本提交补丁构建的安装包，页面计时源带按页面的时钟偏移，安装包只带 Windows 指纹读取的字体分组。" assets/*.zip
+        env:
+          GH_TOKEN: ${{ github.token }}
