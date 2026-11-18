@@ -173,7 +173,7 @@ package-linux: fonts-extract
 		--version $(version) \
 		--release $(release) \
 		--arch $(arch) \
-		--fonts windows macos linux
+		--fonts windows
 
 package-macos: fonts-extract
 	python3 scripts/package.py macos \
@@ -182,7 +182,7 @@ package-macos: fonts-extract
 		--version $(version) \
 		--release $(release) \
 		--arch $(arch) \
-		--fonts windows macos linux
+		--fonts windows
 
 package-windows: fonts-extract
 	python3 scripts/package.py windows \
@@ -191,8 +191,7 @@ package-windows: fonts-extract
 			~/.mozbuild/vs/VC/Redist/MSVC/*/$(vcredist_arch)/Microsoft.VC*.CRT/*.dll \
 		--version $(version) \
 		--release $(release) \
-		--arch $(arch) \
-		--fonts windows macos linux
+		--arch $(arch)
 
 run:
 	cd $(cf_source_dir) \
